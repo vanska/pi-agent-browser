@@ -1,8 +1,9 @@
-import { readFileSync, mkdtempSync, writeFileSync } from "node:fs";
+import { readFileSync, mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, extname } from "node:path";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
+  getAgentDir,
   truncateHead,
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
@@ -10,6 +11,55 @@ import {
 } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
+
+const BROWSER_TOOL_NAME = "browser";
+
+const SETTINGS_PATH = join(getAgentDir(), "settings.json");
+
+function readSettings(): Record<string, unknown> {
+  try {
+    return JSON.parse(readFileSync(SETTINGS_PATH, "utf8")) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+async function writeSettings(updates: Record<string, unknown>): Promise<void> {
+  const current = readSettings();
+  const next = { ...current, ...updates };
+  mkdirSync(getAgentDir(), { recursive: true });
+  writeFileSync(SETTINGS_PATH, `${JSON.stringify(next, null, 2)}\n`);
+}
+
+function getEnabledSetting(): boolean {
+  const settings = readSettings();
+  const piAgentBrowser = settings.piAgentBrowser as Record<string, unknown> | undefined;
+  return piAgentBrowser?.enabled !== false;
+}
+
+async function syncToolAvailability(pi: ExtensionAPI): Promise<void> {
+  const enabled = getEnabledSetting();
+
+  const activeTools = pi.getActiveTools();
+  if (!enabled && activeTools.includes(BROWSER_TOOL_NAME)) {
+    pi.setActiveTools(activeTools.filter((name) => name !== BROWSER_TOOL_NAME));
+  } else if (enabled && !activeTools.includes(BROWSER_TOOL_NAME)) {
+    const allTools = pi.getAllTools();
+    if (allTools.map((t) => t.name).includes(BROWSER_TOOL_NAME)) {
+      pi.setActiveTools([...activeTools, BROWSER_TOOL_NAME]);
+    }
+  }
+}
+
+async function updateStatusBar(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
+  const enabled = getEnabledSetting();
+
+  if (!enabled) {
+    ctx.ui.setStatus("pi-agent-browser", ctx.ui.theme.fg("warning", "pi-agent-browser: disabled"));
+  } else {
+    ctx.ui.setStatus("pi-agent-browser", undefined);
+  }
+}
 
 const TOOL_DESCRIPTION = `Browser automation via agent-browser CLI.
 Workflow: open URL → snapshot -i (get @refs like @e1) → interact → re-snapshot after page changes.
@@ -74,8 +124,57 @@ async function ensureInstalled(pi: ExtensionAPI, ctx: any): Promise<boolean> {
 }
 
 export default function agentBrowserExtension(pi: ExtensionAPI) {
+  pi.on("session_start", async (_event, ctx) => {
+    await syncToolAvailability(pi);
+    await updateStatusBar(pi, ctx);
+  });
+
+  pi.registerCommand("agent-browser-enable", {
+    description: "Enable the agent-browser extension and its browser tool",
+    handler: async (_args, ctx) => {
+      if (getEnabledSetting()) {
+        ctx.ui.notify("agent-browser is already enabled.", "info");
+        return;
+      }
+
+      await writeSettings({ piAgentBrowser: { enabled: true } });
+      await syncToolAvailability(pi);
+      await updateStatusBar(pi, ctx);
+      ctx.ui.notify("agent-browser enabled. The browser tool will be available on the next turn.", "info");
+    },
+  });
+
+  pi.registerCommand("agent-browser-disable", {
+    description: "Disable the agent-browser extension and hide its browser tool",
+    handler: async (_args, ctx) => {
+      if (!getEnabledSetting()) {
+        ctx.ui.notify("agent-browser is already disabled.", "info");
+        return;
+      }
+
+      await writeSettings({ piAgentBrowser: { enabled: false } });
+      await syncToolAvailability(pi);
+      await updateStatusBar(pi, ctx);
+      ctx.ui.notify("agent-browser disabled. The browser tool is hidden from the agent.", "info");
+    },
+  });
+
+  pi.registerCommand("agent-browser-status", {
+    description: "Show agent-browser extension status",
+    handler: async (_args, ctx) => {
+      const enabled = getEnabledSetting();
+      const activeTools = pi.getActiveTools();
+      const toolActive = activeTools.includes(BROWSER_TOOL_NAME);
+
+      const state = enabled
+        ? `agent-browser: enabled, browser tool ${toolActive ? "active" : "hidden"}`
+        : `agent-browser: disabled, browser tool hidden`;
+      ctx.ui.notify(state, "info");
+    },
+  });
+
   pi.registerTool({
-    name: "browser",
+    name: BROWSER_TOOL_NAME,
     label: "Browser",
     description: TOOL_DESCRIPTION,
     parameters: Type.Object({
@@ -166,26 +265,26 @@ export default function agentBrowserExtension(pi: ExtensionAPI) {
       if (action === "screenshot") {
         const pathMatch = output.match(/saved to (.+)$/i);
         if (pathMatch) {
-          const screenshotPath = pathMatch[1].trim();
-          try {
-            const imageData = readFileSync(screenshotPath);
-            const base64 = imageData.toString("base64");
-            const ext = extname(screenshotPath).toLowerCase();
-            const mimeType = ext === ".jpg" || ext === ".jpeg" ? "image/jpeg"
-              : ext === ".webp" ? "image/webp"
+        const screenshotPath = pathMatch[1].trim();
+        try {
+          const imageData = readFileSync(screenshotPath);
+          const base64 = imageData.toString("base64");
+          const ext = extname(screenshotPath).toLowerCase();
+          const mimeType = ext === ".jpg" || ext === ".jpeg" ? "image/jpeg"
+            : ext === ".webp" ? "image/webp"
               : "image/png";
-            return {
-              content: [
-                { type: "text", text: `Screenshot saved: ${screenshotPath}` },
-                { type: "image", data: base64, mimeType },
-              ],
-              details: { command: commandStr, action, screenshotPath },
-            };
-          } catch (err: any) {
-            return {
-              content: [{ type: "text", text: `Screenshot saved to ${screenshotPath} but could not read file: ${err.message}` }],
-              details: { command: commandStr, action, screenshotPath, readError: err.message },
-            };
+          return {
+            content: [
+              { type: "text", text: `Screenshot saved: ${screenshotPath}` },
+              { type: "image", data: base64, mimeType },
+            ],
+            details: { command: commandStr, action, screenshotPath },
+          };
+        } catch (err: any) {
+          return {
+            content: [{ type: "text", text: `Screenshot saved to ${screenshotPath} but could not read file: ${err.message}` }],
+            details: { command: commandStr, action, screenshotPath, readError: err.message },
+          };
           }
         }
       }
